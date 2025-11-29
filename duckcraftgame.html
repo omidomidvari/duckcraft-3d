@@ -1,0 +1,549 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Duckcraft</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family: system-ui, sans-serif; }
+    #hud { position:fixed; top:8px; left:8px; color:#fff; z-index:5; background:rgba(0,0,0,0.35); padding:6px 10px; border-radius:8px; font-size:14px; }
+    #hud b { color:#ffd000; }
+    canvas { display:block; width:100vw; height:100vh; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div><b>Duckcraft</b> — WASD move, mouse/←→ look, click place/break, V view, F fullscreen, C crafting, Enter menu start</div>
+    <div id="time"></div>
+  </div>
+  <canvas id="game"></canvas>
+  <script>
+  (() => {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    const hudTime = document.getElementById('time');
+    const resize = () => { canvas.width = innerWidth; canvas.height = innerHeight; };
+    addEventListener('resize', resize); resize();
+
+    // Game state
+    let gameState = 'menu'; // 'menu', 'options', 'playing'
+    let viewMode = 'fps'; // 'fps' or 'map'
+    let craftingOpen = false;
+    let furnaceOpen = false;
+    let activeFurnacePos = null;
+
+    // World
+    const MAP_W = 32, MAP_H = 32;
+    const EMPTY=0, BLOCK=1, LEAF=2, STUMP=3, GRASS=4, STONE=5, BARRIER=6, COAL=7, IRON=8, GOLD=9, DIAMOND=10, FURNACE=11;
+    const world = Array.from({length:MAP_H}, () => Array(MAP_W).fill(GRASS));
+
+    // Sprinkle some initial stone patches
+    for (let i=0;i<180;i++) {
+      const x = Math.floor(Math.random()*MAP_W), y = Math.floor(Math.random()*MAP_H);
+      world[y][x] = STONE;
+    }
+
+    // Player
+    const player = { x: 4.5, y: 4.5, angle: Math.PI/6, fov: Math.PI/3, speed: 2.2, rotSpeed: 2.4, sprintMul: 1.6, color:'#ffd000', hp: 20 };
+
+    // Items & inventory
+    const ITEM = {
+      BLOCK:'block', LEAF:'leaf', STUMP:'stump', GRASS:'grass', STONE:'stone',
+      COAL:'coal', IRON:'iron', GOLD:'gold', DIAMOND:'diamond',
+      SWORD:'sword', PICKAXE:'pickaxe', AXE:'axe', FURNACE:'furnace',
+      MEAT:'meat', EGG:'egg', WOOL:'wool'
+    };
+    const inventory = [
+      {type:ITEM.BLOCK, count:10},
+      {type:ITEM.LEAF, count:2},
+      {type:ITEM.STUMP, count:2},
+      {type:ITEM.GRASS, count:0},
+      {type:ITEM.STONE, count:4},
+      {type:ITEM.SWORD, count:0},
+      {type:ITEM.PICKAXE, count:0},
+      {type:ITEM.AXE, count:0},
+      {type:ITEM.FURNACE, count:0},
+      {type:ITEM.COAL, count:0},
+      {type:ITEM.IRON, count:0},
+      {type:ITEM.GOLD, count:0},
+      {type:ITEM.DIAMOND, count:0},
+      {type:ITEM.MEAT, count:0},
+      {type:ITEM.EGG, count:0},
+      {type:ITEM.WOOL, count:0}
+    ];
+    let selectedSlot = 0;
+    function addItem(type, n=1) { const s = inventory.find(v=>v.type===type); if (s) s.count += n; }
+
+    // Crafting
+    const recipes = [
+      { name:'Sword', output:ITEM.SWORD, inputs:{ [ITEM.STUMP]:1, [ITEM.STONE]:2 } },
+      { name:'Pickaxe', output:ITEM.PICKAXE, inputs:{ [ITEM.STUMP]:2, [ITEM.STONE]:1 } },
+      { name:'Axe', output:ITEM.AXE, inputs:{ [ITEM.STUMP]:2, [ITEM.LEAF]:1 } },
+      { name:'Furnace', output:ITEM.FURNACE, inputs:{ [ITEM.STONE]:8 } }
+    ];
+    function canCraft(r) {
+      return Object.entries(r.inputs).every(([t,n]) => {
+        const s = inventory.find(v=>v.type===t); return s && s.count>=n;
+      });
+    }
+    function craft(itemType) {
+      const r = recipes.find(rr=>rr.output===itemType); if(!r||!canCraft(r)) return false;
+      for (const [t,n] of Object.entries(r.inputs)) inventory.find(v=>v.type===t).count -= n;
+      addItem(itemType,1); return true;
+    }
+
+    // Day/night
+    let timeOfDay = 0; // 0..1
+    let dayLengthSec = 60;
+    function updateDayNight(dt) {
+      timeOfDay = (timeOfDay + dt/dayLengthSec) % 1;
+      const hour = Math.floor(timeOfDay * 24);
+      hudTime.textContent = `Time: ${hour}:00  | HP: ${player.hp}`;
+    }
+    function getSkyColor() {
+      const t=timeOfDay, light=Math.max(0, Math.sin(t*Math.PI));
+      const base=(20+120*light)|0;
+      const skyTop = `rgb(${(base*0.6)|0}, ${(base*0.8)|0}, ${base})`;
+      const skyBottom = `rgb(${(base*0.9)|0}, ${base}, ${(base*0.8)|0})`;
+      return { skyTop, skyBottom, light };
+    }
+
+    // Input
+    const keys = new Set(); let mouseLook=false;
+    addEventListener('keydown', e => {
+      keys.add(e.key.toLowerCase());
+      if (gameState==='menu') {
+        if (e.key.toLowerCase()==='enter') gameState='playing';
+        if (e.key.toLowerCase()==='o') gameState='options';
+        if (e.key.toLowerCase()==='q') location.reload();
+        return;
+      }
+      if (gameState==='options') {
+        if (e.key==='1') toggleFullscreen();
+        if (e.key==='2') viewMode = (viewMode==='fps'?'map':'fps');
+        if (e.key==='3') {
+          if (dayLengthSec===60) dayLengthSec=30; else if (dayLengthSec===30) dayLengthSec=120; else dayLengthSec=60;
+        }
+        if (e.key.toLowerCase()==='escape') gameState='menu';
+        return;
+      }
+      // playing
+      if (e.key.toLowerCase()==='f') toggleFullscreen();
+      if (e.key.toLowerCase()==='v') viewMode = (viewMode==='fps'?'map':'fps');
+      if (e.key.toLowerCase()==='c') craftingOpen = !craftingOpen;
+      if (e.key==='arrowleft') selectedSlot = (selectedSlot + inventory.length - 1) % inventory.length;
+      if (e.key==='arrowright') selectedSlot = (selectedSlot + 1) % inventory.length;
+      if (craftingOpen) {
+        if (e.key==='1') craft(ITEM.SWORD);
+        if (e.key==='2') craft(ITEM.PICKAXE);
+        if (e.key==='3') craft(ITEM.AXE);
+      }
+    });
+    addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
+    canvas.addEventListener('click', () => { canvas.requestPointerLock?.(); });
+    addEventListener('pointerlockchange', () => { mouseLook = (document.pointerLockElement===canvas); });
+    addEventListener('mousemove', e => {
+      if (mouseLook && gameState==='playing' && viewMode==='fps') {
+        player.angle += e.movementX*0.0025; const TWO=Math.PI*2;
+        player.angle = (player.angle%TWO+TWO)%TWO;
+      }
+    });
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    canvas.addEventListener('mousedown', e => {
+      if (gameState!=='playing') return;
+      if (viewMode==='map') {
+        const {scale,ox,oy} = mapMetrics();
+        const mx = Math.floor((e.clientX-ox)/scale), my = Math.floor((e.clientY-oy)/scale);
+        if (mx>=0&&my>=0&&mx<MAP_W&&my<MAP_H) {
+          if (e.button===0) placeBlock(mx,my);
+          else if (e.button===2) interactAt(mx,my);
+        }
+      } else {
+        if (e.button===0) placeAtCrosshair();
+        else if (e.button===2) breakAtCrosshair();
+      }
+    });
+
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+      else document.exitFullscreen?.();
+    }
+
+    // Colors
+    function tileColor(t) {
+      switch(t){
+        case BLOCK: return 'rgb(0,160,40)';
+        case LEAF: return 'rgb(0,200,0)';
+        case STUMP: return 'rgb(120,70,20)';
+        case GRASS: return 'rgb(50,180,50)';
+        case STONE: return 'rgb(130,130,130)';
+        case BARRIER: return 'rgb(0,0,0)';
+        case COAL: return 'rgb(40,40,40)';
+        case IRON: return 'rgb(180,180,180)';
+        case GOLD: return 'rgb(255,215,0)';
+        case DIAMOND: return 'rgb(0,255,255)';
+        case FURNACE: return 'rgb(100,100,100)';
+        default: return 'rgb(30,40,30)';
+      }
+    }
+
+    // Movement
+    function isBlocked(x,y){
+      if (x<0||y<0||x>=MAP_W||y>=MAP_H) return true;
+      const t=world[Math.floor(y)][Math.floor(x)];
+      return [BLOCK,LEAF,STUMP,STONE,COAL,IRON,GOLD,DIAMOND,FURNACE,BARRIER].includes(t);
+    }
+    function updatePlayer(dt){
+      let rot=0, move=0, strafe=0;
+      if (keys.has('arrowleft')) rot-=1;
+      if (keys.has('arrowright')) rot+=1;
+      if (keys.has('a')) strafe-=1;
+      if (keys.has('d')) strafe+=1;
+      if (keys.has('w')) move+=1;
+      if (keys.has('s')) move-=1;
+      player.angle += rot*player.rotSpeed*dt;
+      const speed = player.speed*(keys.has('shift')?player.sprintMul:1);
+      const dx = Math.cos(player.angle)*move*speed + Math.cos(player.angle+Math.PI/2)*strafe*speed;
+      const dy = Math.sin(player.angle)*move*speed + Math.sin(player.angle+Math.PI/2)*strafe*speed;
+      const nx=player.x+dx*dt, ny=player.y+dy*dt;
+      if (!isBlocked(nx,player.y)) player.x=nx;
+      if (!isBlocked(player.x,ny)) player.y=ny;
+    }
+
+    // Rays
+    function castRay(rayAngle){
+      const sin=Math.sin(rayAngle), cos=Math.cos(rayAngle);
+      let mapX=Math.floor(player.x), mapY=Math.floor(player.y);
+      const deltaDistX=Math.abs(1/(cos||1e-6)), deltaDistY=Math.abs(1/(sin||1e-6));
+      let stepX,stepY,side, sideDistX,sideDistY;
+      if (cos<0){ stepX=-1; sideDistX=(player.x-mapX)*deltaDistX; } else { stepX=1; sideDistX=(mapX+1-player.x)*deltaDistX; }
+      if (sin<0){ stepY=-1; sideDistY=(player.y-mapY)*deltaDistY; } else { stepY=1; sideDistY=(mapY+1-player.y)*deltaDistY; }
+      let hit=0,tile=EMPTY;
+      while (!hit && mapX>=0&&mapY>=0&&mapX<MAP_W&&mapY<MAP_H){
+        if (sideDistX<sideDistY){ sideDistX+=deltaDistX; mapX+=stepX; side=0; }
+        else { sideDistY+=deltaDistY; mapY+=stepY; side=1; }
+        tile=world[mapY][mapX];
+        if (tile!==GRASS && tile!==EMPTY) hit=1;
+      }
+      const dist = hit ? (side===0 ? (mapX-player.x+(1-stepX)/2)/cos : (mapY-player.y+(1-stepY)/2)/sin) : 1e6;
+      return { dist, hitX:mapX, hitY:mapY, tile, side };
+    }
+    function shadeGreen(tile, dist, side, light){
+      const a = Math.max(0.3, 0.9*light), fade=Math.min(1,dist/12);
+      let r=0,g=160,b=40;
+      if (tile===LEAF) { g=200; b=0; }
+      if (tile===STUMP) { r=120; g=70; b=20; }
+      if ([STONE,COAL,IRON,GOLD,DIAMOND,FURNACE].includes(tile)) { r=g=b=120; if(tile===COAL) r=g=b=40; if(tile===IRON) r=g=b=180; if(tile===GOLD){ r=255; g=215; b=0; } if(tile===DIAMOND){ r=0; g=255; b=255; } if(tile===FURNACE){ r=g=b=100; } }
+      const gg=Math.max(30, g - 110*fade - (side?15:0));
+      const rr=Math.max(30, r - 110*fade);
+      const bb=Math.max(30, b - 110*fade);
+      return `rgba(${rr|0}, ${gg|0}, ${bb|0}, ${a})`;
+    }
+
+    function renderFPS(){
+      // Sky + ground
+      const { skyTop, skyBottom, light } = getSkyColor();
+      const grad = ctx.createLinearGradient(0,0,0,canvas.height/2);
+      grad.addColorStop(0, skyTop); grad.addColorStop(1, skyBottom);
+      ctx.fillStyle = grad; ctx.fillRect(0,0,canvas.width,canvas.height/2);
+      ctx.fillStyle = `rgb(${20+40*light|0}, ${25+45*light|0}, ${20+35*light|0})`;
+      ctx.fillRect(0,canvas.height/2, canvas.width, canvas.height/2);
+
+      const numRays = canvas.width, startAngle = player.angle - player.fov/2;
+      for (let col=0; col<numRays; col++){
+        const rayAngle = startAngle + (col/numRays)*player.fov;
+        const { dist, tile, side } = castRay(rayAngle);
+        const corrected = dist * Math.cos(rayAngle - player.angle);
+        const wallHeight = Math.min(canvas.height, (canvas.height / corrected));
+        const yTop = Math.max(0, canvas.height/2 - wallHeight/2);
+        const yBottom = Math.min(canvas.height, canvas.height/2 + wallHeight/2);
+        if (tile!==GRASS && tile!==EMPTY){
+          ctx.fillStyle = shadeGreen(tile, corrected, side, light);
+          ctx.fillRect(col, yTop, 1, yBottom-yTop);
+        }
+      }
+      // Player compass dot
+      ctx.fillStyle = player.color; ctx.fillRect(8, canvas.height-16, 8, 8);
+    }
+
+    function mapMetrics(){
+      const scale = Math.min(canvas.width/MAP_W, canvas.height/MAP_H);
+      const ox = (canvas.width - MAP_W*scale)/2;
+      const oy = (canvas.height - MAP_H*scale)/2;
+      return {scale,ox,oy};
+    }
+    function renderMap(){
+      const {scale,ox,oy} = mapMetrics();
+      const {skyTop} = getSkyColor();
+      ctx.fillStyle = skyTop; ctx.fillRect(0,0,canvas.width,canvas.height);
+      for (let y=0;y<MAP_H;y++){
+        for (let x=0;x<MAP_W;x++){
+          const t=world[y][x];
+          ctx.fillStyle = tileColor(t);
+          ctx.fillRect(ox+x*scale, oy+y*scale, scale, scale);
+        }
+      }
+      // Player
+      ctx.fillStyle=player.color; ctx.beginPath();
+      ctx.arc(ox+player.x*scale, oy+player.y*scale, scale*0.25, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle='#ffd000'; ctx.beginPath();
+      ctx.moveTo(ox+player.x*scale, oy+player.y*scale);
+      ctx.lineTo(ox+(player.x+Math.cos(player.angle)*0.9)*scale, oy+(player.y+Math.sin(player.angle)*0.9)*scale);
+      ctx.stroke();
+      renderAnimals(scale,ox,oy);
+      renderMonsters(scale,ox,oy);
+    }
+
+    // Place/break
+    function placeBlock(x,y){
+      const slot = inventory[selectedSlot]; if (!slot || slot.count<=0) return;
+      if (world[y][x]!==GRASS && world[y][x]!==EMPTY) return;
+      if (slot.type===ITEM.BLOCK) world[y][x]=BLOCK;
+      else if (slot.type===ITEM.LEAF) world[y][x]=LEAF;
+      else if (slot.type===ITEM.STUMP) world[y][x]=STUMP;
+      else if (slot.type===ITEM.GRASS) world[y][x]=GRASS;
+      else if (slot.type===ITEM.STONE) world[y][x]=STONE;
+      else if (slot.type===ITEM.FURNACE) world[y][x]=FURNACE;
+      else if (slot.type===ITEM.COAL) world[y][x]=COAL;
+      else if (slot.type===ITEM.IRON) world[y][x]=IRON;
+      else if (slot.type===ITEM.GOLD) world[y][x]=GOLD;
+      else if (slot.type===ITEM.DIAMOND) world[y][x]=DIAMOND;
+      slot.count--;
+    }
+    function breakBlock(x,y){
+      const t=world[y][x];
+      const sel = inventory[selectedSlot]?.type;
+      if (t===GRASS){ world[y][x]=EMPTY; addItem(ITEM.GRASS); return; }
+      if (t===STONE){
+        if (sel===ITEM.PICKAXE) { world[y][x]=GRASS; addItem(ITEM.STONE); } else { world[y][x]=GRASS; addItem(ITEM.STONE); }
+        return;
+      }
+      if (t===BLOCK){ world[y][x]=GRASS; addItem(ITEM.BLOCK); return; }
+      if (t===LEAF){ world[y][x]=GRASS; addItem(ITEM.LEAF); return; }
+      if (t===STUMP){ if (sel===ITEM.AXE){ world[y][x]=GRASS; addItem(ITEM.STUMP);} else { world[y][x]=GRASS; addItem(ITEM.STUMP);} return; }
+      if (t===COAL||t===IRON||t===GOLD||t===DIAMOND){
+        if (sel===ITEM.PICKAXE){ world[y][x]=STONE; addItem(t===COAL?ITEM.COAL:t===IRON?ITEM.IRON:t===GOLD?ITEM.GOLD:ITEM.DIAMOND); }
+        return;
+      }
+      if (t===FURNACE){ world[y][x]=GRASS; addItem(ITEM.FURNACE); return; }
+      if (t===BARRIER){ /* unbreakable */ return; }
+    }
+    function interactAt(x,y){
+      if (world[y][x]===FURNACE) openFurnace(x,y);
+      else breakBlock(x,y);
+    }
+    function findInteractTile(placeMode){
+      const maxSteps=32, step=0.1; let rx=player.x, ry=player.y;
+      const dx=Math.cos(player.angle)*step, dy=Math.sin(player.angle)*step; let lastGrass=null;
+      for (let i=0;i<maxSteps;i++){
+        rx+=dx; ry+=dy; const xi=Math.floor(rx), yi=Math.floor(ry);
+        if (xi<0||yi<0||xi>=MAP_W||yi>=MAP_H) break;
+        const t=world[yi][xi];
+        if (placeMode){ if (t===GRASS||t===EMPTY) lastGrass={x:xi,y:yi}; else return lastGrass; }
+        else {
+          // monster/animal first
+          const m = findMonsterAt(xi,yi); if (m) return {x:xi,y:yi, monster:true};
+          const a = findAnimalAt(xi,yi); if (a) return {x:xi,y:yi, animal:true};
+          if (t!==GRASS&&t!==EMPTY) return {x:xi,y:yi};
+        }
+      }
+      return placeMode?lastGrass:null;
+    }
+    function placeAtCrosshair(){ const tgt=findInteractTile(true); if (tgt) placeBlock(tgt.x,tgt.y); }
+    function breakAtCrosshair(){
+      const tgt=findInteractTile(false);
+      if (!tgt) return;
+      if (tgt.monster){ attackMonster(tgt.x,tgt.y); return; }
+      if (tgt.animal){ attackAnimal(tgt.x,tgt.y); return; }
+      interactAt(tgt.x,tgt.y);
+    }
+
+    // Animals
+    const ANIMAL={ SHEEP:'sheep', CHICKEN:'chicken', PIG:'pig' };
+    class Animal { constructor(type,x,y){ this.type=type; this.x=x; this.y=y; this.hp=3; } }
+    const animals=[];
+    function spawnAnimals(){
+      for (let i=0;i<6;i++){
+        animals.push(new Animal([ANIMAL.SHEEP,ANIMAL.CHICKEN,ANIMAL.PIG][i%3], Math.floor(Math.random()*MAP_W), Math.floor(Math.random()*MAP_H)));
+      }
+    }
+    spawnAnimals();
+    function updateAnimals(dt){
+      animals.forEach(a=>{
+        if (Math.random()<0.01){
+          a.x = Math.max(0, Math.min(MAP_W-1, a.x + (Math.random()<0.5?-1:1)*0.2));
+          a.y = Math.max(0, Math.min(MAP_H-1, a.y + (Math.random()<0.5?-1:1)*0.2));
+        }
+      });
+    }
+    function renderAnimals(scale,ox,oy){
+      animals.forEach(a=>{
+        ctx.fillStyle = a.type===ANIMAL.SHEEP ? '#fff' : a.type===ANIMAL.CHICKEN ? '#ff0' : '#f88';
+        ctx.beginPath(); ctx.arc(ox+a.x*scale, oy+a.y*scale, scale*0.25, 0, Math.PI*2); ctx.fill();
+      });
+    }
+    function findAnimalAt(x,y){ return animals.find(a=>Math.floor(a.x)===x && Math.floor(a.y)===y); }
+    function attackAnimal(x,y){
+      const a = findAnimalAt(x,y); if (!a) return;
+      const sel = inventory[selectedSlot].type;
+      a.hp -= (sel===ITEM.SWORD?3:1);
+      if (a.hp<=0){
+        if (a.type===ANIMAL.SHEEP) addItem(ITEM.WOOL,1);
+        if (a.type===ANIMAL.CHICKEN) addItem(ITEM.EGG,1);
+        if (a.type===ANIMAL.PIG) addItem(ITEM.MEAT,1);
+        animals.splice(animals.indexOf(a),1);
+      }
+    }
+
+    // Monsters
+    const MONSTER={ ZOMBIE:'zombie', SPIDER:'spider', SKELETON:'skeleton' };
+    class Monster { constructor(type,x,y){ this.type=type; this.x=x; this.y=y; this.hp=5; this.damage=1; } }
+    const monsters=[];
+    function spawnMonsters(){
+      if (timeOfDay>0.5 && monsters.length<8){
+        const x=Math.floor(Math.random()*MAP_W), y=Math.floor(Math.random()*MAP_H);
+        monsters.push(new Monster([MONSTER.ZOMBIE,MONSTER.SPIDER,MONSTER.SKELETON][Math.floor(Math.random()*3)], x,y));
+      }
+    }
+    function updateMonsters(dt){
+      monsters.forEach(m=>{
+        const dx=player.x-m.x, dy=player.y-m.y, d=Math.hypot(dx,dy);
+        if (d>0.5){ m.x += (dx/d)*dt*1.2; m.y += (dy/d)*dt*1.2; }
+        else { player.hp = Math.max(0, player.hp - m.damage*dt*2); }
+      });
+      // remove dead
+      for (let i=monsters.length-1;i>=0;i--) if (monsters[i].hp<=0) monsters.splice(i,1);
+    }
+    function renderMonsters(scale,ox,oy){
+      monsters.forEach(m=>{
+        ctx.fillStyle = m.type===MONSTER.ZOMBIE ? '#0f0' : m.type===MONSTER.SPIDER ? '#800' : '#fff';
+        ctx.beginPath(); ctx.arc(ox+m.x*scale, oy+m.y*scale, scale*0.25, 0, Math.PI*2); ctx.fill();
+      });
+    }
+    function findMonsterAt(x,y){ return monsters.find(m=>Math.floor(m.x)===x && Math.floor(m.y)===y); }
+    function attackMonster(x,y){
+      const m = findMonsterAt(x,y); if (!m) return;
+      const sel = inventory[selectedSlot].type;
+      m.hp -= (sel===ITEM.SWORD?3:1);
+      if (m.hp<=0){
+        // simple loot
+        if (m.type===MONSTER.ZOMBIE) addItem(ITEM.STUMP,1);
+        if (m.type===MONSTER.SPIDER) addItem(ITEM.LEAF,1);
+        if (m.type===MONSTER.SKELETON) addItem(ITEM.STONE,1);
+      }
+    }
+
+    // Furnaces
+    function openFurnace(x,y){ furnaceOpen=true; activeFurnacePos={x,y}; }
+    function closeFurnace(){ furnaceOpen=false; activeFurnacePos=null; }
+    const smelts = {
+      [ITEM.IRON]:'iron_ingot',
+      [ITEM.GOLD]:'gold_ingot',
+      [ITEM.MEAT]:'cooked_meat'
+    };
+    function smelt(input){
+      // consume 1 coal + 1 input -> output
+      const coalSlot = inventory.find(s=>s.type===ITEM.COAL);
+      const inSlot = inventory.find(s=>s.type===input);
+      const out = smelts[input];
+      if (!coalSlot || coalSlot.count<=0 || !inSlot || inSlot.count<=0 || !out) return false;
+      coalSlot.count--; inSlot.count--;
+      // store output as text item (add to grass slot label? For simplicity, append to MEAT/IRON/GOLD slots)
+      addItem(out,1); // creates dynamic property; we’ll display separately
+      return true;
+    }
+
+    // Rendering UI
+    function renderInventory(){
+      const barH=64; ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(0,canvas.height-barH, canvas.width, barH);
+      const slotW=110; ctx.textAlign='left'; ctx.fillStyle='#fff'; ctx.font='14px sans-serif';
+      inventory.forEach((s,i)=>{
+        const x=i*slotW+8, y=canvas.height-barH+8;
+        ctx.strokeStyle = (i===selectedSlot)?'#ffd000':'#888'; ctx.lineWidth=2; ctx.strokeRect(x, y, slotW-16, barH-16);
+        ctx.fillText(`${s.type}: ${s.count}`, x+8, y+24);
+      });
+      if (craftingOpen) renderCraftingMenu();
+      if (furnaceOpen) renderFurnaceMenu();
+    }
+    function renderCraftingMenu(){
+      ctx.fillStyle='rgba(0,0,0,0.7)'; const w=canvas.width/2, h=canvas.height/2, x=canvas.width/4, y=canvas.height/4;
+      ctx.fillRect(x,y,w,h); ctx.fillStyle='#fff'; ctx.font='20px sans-serif'; ctx.textAlign='center';
+      ctx.fillText('Crafting (C to close)', canvas.width/2, y+32);
+      const lines = [
+        `1: Sword (1 stump + 2 stone) ${canCraft(recipes[0])?'[OK]':'[Need]'} `,
+        `2: Pickaxe (2 stumps + 1 stone) ${canCraft(recipes[1])?'[OK]':'[Need]'} `,
+        `3: Axe (2 stumps + 1 leaf) ${canCraft(recipes[2])?'[OK]':'[Need]'} `,
+        `Furnace: craft via menu (8 stone)`
+      ];
+      lines.forEach((t,i)=> ctx.fillText(t, canvas.width/2, y+80+i*28));
+    }
+    function renderFurnaceMenu(){
+      ctx.fillStyle='rgba(0,0,0,0.7)'; const w=canvas.width/2, h=canvas.height/2, x=canvas.width/4, y=canvas.height/4;
+      ctx.fillRect(x,y,w,h); ctx.fillStyle='#fff'; ctx.font='20px sans-serif'; ctx.textAlign='center';
+      ctx.fillText('Furnace (click to smelt, Esc to close)', canvas.width/2, y+32);
+      ctx.fillText('Fuel: Coal (consumes 1)', canvas.width/2, y+72);
+      ctx.fillText('Input: Iron -> Iron Ingot | Gold -> Gold Ingot | Meat -> Cooked Meat', canvas.width/2, y+102);
+    }
+    // Furnace click handling
+    canvas.addEventListener('mouseup', (e)=>{
+      if (!furnaceOpen) return;
+      // Simple smelt priority: try iron, then gold, then meat
+      if (smelt(ITEM.IRON)) return;
+      if (smelt(ITEM.GOLD)) return;
+      if (smelt(ITEM.MEAT)) return;
+    });
+    addEventListener('keydown', (e)=>{
+      if (furnaceOpen && e.key.toLowerCase()==='escape') closeFurnace();
+    });
+
+    // Menu/Options render
+    function renderMenu(){
+      ctx.fillStyle='#000'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle='#ffd000'; ctx.font='48px sans-serif'; ctx.textAlign='center';
+      ctx.fillText('Duckcraft', canvas.width/2, canvas.height/3);
+      ctx.fillStyle='#fff'; ctx.font='24px sans-serif';
+      ctx.fillText('Press ENTER to Start', canvas.width/2, canvas.height/2);
+      ctx.fillText('Press O for Options', canvas.width/2, canvas.height/2+40);
+      ctx.fillText('Press Q to Quit', canvas.width/2, canvas.height/2+80);
+    }
+    function renderOptions(){
+      ctx.fillStyle='#222'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle='#ffd000'; ctx.font='40px sans-serif'; ctx.textAlign='center';
+      ctx.fillText('Options', canvas.width/2, canvas.height/4);
+      ctx.fillStyle='#fff'; ctx.font='20px sans-serif';
+      ctx.fillText('1: Toggle Fullscreen', canvas.width/2, canvas.height/2-40);
+      ctx.fillText(`2: Toggle View Mode (Currently: ${viewMode.toUpperCase()})`, canvas.width/2, canvas.height/2);
+      ctx.fillText(`3: Day/Night Speed (Currently: ${dayLengthSec}s)`, canvas.width/2, canvas.height/2+40);
+      ctx.fillText('Press ESC to return', canvas.width/2, canvas.height/2+100);
+    }
+
+    // Main loop
+    let last=performance.now();
+    function loop(now){
+      const dt = Math.min(0.05, (now-last)/1000); last=now;
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+
+      if (gameState==='menu'){ renderMenu(); requestAnimationFrame(loop); return; }
+      if (gameState==='options'){ renderOptions(); requestAnimationFrame(loop); return; }
+
+      // playing
+      updatePlayer(dt); updateDayNight(dt);
+      updateAnimals(dt); spawnMonsters(); updateMonsters(dt);
+
+      if (viewMode==='fps') renderFPS(); else renderMap();
+      renderInventory();
+
+      if (player.hp<=0){
+        ctx.fillStyle='rgba(0,0,0,0.8)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='32px sans-serif';
+        ctx.fillText('You Died — Press Enter to restart', canvas.width/2, canvas.height/2);
+        if (keys.has('enter')) { player.hp=20; player.x=4.5; player.y=4.5; monsters.length=0; }
+      }
+
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  })();
+  </script>
+</body>
+</html>
