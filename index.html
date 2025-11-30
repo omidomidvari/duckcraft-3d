@@ -1,142 +1,105 @@
-<!doctype html>
-<html lang="en">
+
+   <!doctype html>
+<html>
 <head>
-  <meta charset="utf-8" />
-  <title>Duckcraft Underground + Hotbar</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family: system-ui, sans-serif; }
-    #hud { position:fixed; top:8px; left:8px; color:#fff; z-index:5; background:rgba(0,0,0,0.35); padding:6px 10px; border-radius:8px; font-size:14px; }
-    #hud b { color:#ffd000; }
-    canvas { display:block; width:100vw; height:100vh; }
-  </style>
+<meta charset="utf-8">
+<title>Duckcraft Raycast Underground</title>
+<style>
+  html,body {margin:0;height:100%;background:#000;}
+  canvas {display:block;width:100vw;height:100vh;}
+</style>
 </head>
 <body>
-  <div id="hud">
-    <div><b>Duckcraft Underground</b> — WASD move, click break, Shift+Down dig down, Shift+Up dig up, ←/→ hotbar</div>
-  </div>
-  <canvas id="game"></canvas>
-  <script>
-  (() => {
-    const canvas = document.getElementById('game');
-    const ctx = canvas.getContext('2d');
-    const resize = () => { canvas.width = innerWidth; canvas.height = innerHeight; };
-    addEventListener('resize', resize); resize();
+<canvas id="game"></canvas>
+<script>
+const canvas=document.getElementById('game');
+const ctx=canvas.getContext('2d');
+canvas.width=innerWidth; canvas.height=innerHeight;
 
-    // World constants
-    const MAP_W=32, MAP_H=32, DEPTH=3;
-    const EMPTY=0, GRASS=1, STONE=2, ORE=3;
+const MAP_W=32, MAP_H=32, DEPTH=3;
+const EMPTY=0, GRASS=1, STONE=2, ORE=3;
 
-    // Build layered world
-    const world = Array.from({length:DEPTH}, (_,z)=>
-      Array.from({length:MAP_H}, (_,y)=>
-        Array.from({length:MAP_W}, (_,x)=>{
-          if (z===0) return Math.random()<0.2?STONE:GRASS;
-          if (z===1) return Math.random()<0.3?ORE:STONE;
-          return STONE;
-        })
-      )
-    );
+// Generate layered world
+const world = Array.from({length:DEPTH}, (_,z)=>
+  Array.from({length:MAP_H}, (_,y)=>
+    Array.from({length:MAP_W}, (_,x)=>{
+      if(z===0) return Math.random()<0.2?STONE:GRASS;
+      if(z===1) return Math.random()<0.3?ORE:STONE;
+      return STONE;
+    })
+  )
+);
 
-    // Player
-    const player = { x:MAP_W/2, y:MAP_H/2, z:0 };
+const player={x:MAP_W/2,y:MAP_H/2,z:0,angle:0,fov:Math.PI/3};
 
-    // Inventory + hotbar
-    const inventory = [
-      {name:'Grass', count:5},
-      {name:'Stone', count:3},
-      {name:'Ore', count:0},
-      {name:'Block', count:2},
-      {name:'Torch', count:0}
-    ];
-    let selectedSlot = 0;
+// Input
+const keys=new Set();
+addEventListener('keydown',e=>{
+  keys.add(e.key.toLowerCase());
+  if(e.key==='ArrowDown'&&e.shiftKey) if(player.z<DEPTH-1) player.z++;
+  if(e.key==='ArrowUp'&&e.shiftKey) if(player.z>0) player.z--;
+});
+addEventListener('keyup',e=>keys.delete(e.key.toLowerCase()));
 
-    // Input
-    const keys=new Set();
-    addEventListener('keydown', e=>{
-      keys.add(e.key.toLowerCase());
-      if (e.key==='ArrowDown' && e.shiftKey) { if (player.z<DEPTH-1) player.z++; }
-      if (e.key==='ArrowUp' && e.shiftKey) { if (player.z>0) player.z--; }
-      if (e.key==='ArrowLeft') { selectedSlot = (selectedSlot+inventory.length-1)%inventory.length; }
-      if (e.key==='ArrowRight') { selectedSlot = (selectedSlot+1)%inventory.length; }
-    });
-    addEventListener('keyup', e=>keys.delete(e.key.toLowerCase()));
+// Movement
+function update(dt){
+  let dx=0,dy=0;
+  if(keys.has('w')) dy-=1;
+  if(keys.has('s')) dy+=1;
+  if(keys.has('a')) dx-=1;
+  if(keys.has('d')) dx+=1;
+  const nx=player.x+dx*dt*5, ny=player.y+dy*dt*5;
+  if(nx>=0&&ny>=0&&nx<MAP_W&&ny<MAP_H && world[player.z][Math.floor(ny)][Math.floor(nx)]===EMPTY){
+    player.x=nx; player.y=ny;
+  }
+}
 
-    // Movement
-    function updatePlayer(dt){
-      let dx=0,dy=0;
-      if (keys.has('w')) dy-=1;
-      if (keys.has('s')) dy+=1;
-      if (keys.has('a')) dx-=1;
-      if (keys.has('d')) dx+=1;
-      const nx=player.x+dx*dt*5, ny=player.y+dy*dt*5;
-      if (nx>=0&&ny>=0&&nx<MAP_W&&ny<MAP_H && world[player.z][Math.floor(ny)][Math.floor(nx)]===EMPTY){
-        player.x=nx; player.y=ny;
-      }
+// Raycasting
+function castRay(rayAngle){
+  const sin=Math.sin(rayAngle), cos=Math.cos(rayAngle);
+  let mapX=Math.floor(player.x), mapY=Math.floor(player.y);
+  const deltaDistX=Math.abs(1/(cos||1e-6)), deltaDistY=Math.abs(1/(sin||1e-6));
+  let stepX,stepY,side,sideDistX,sideDistY;
+  if(cos<0){stepX=-1;sideDistX=(player.x-mapX)*deltaDistX;} else {stepX=1;sideDistX=(mapX+1-player.x)*deltaDistX;}
+  if(sin<0){stepY=-1;sideDistY=(player.y-mapY)*deltaDistY;} else {stepY=1;sideDistY=(mapY+1-player.y)*deltaDistY;}
+  let hit=0,tile=EMPTY;
+  while(!hit && mapX>=0&&mapY>=0&&mapX<MAP_W&&mapY<MAP_H){
+    if(sideDistX<sideDistY){sideDistX+=deltaDistX;mapX+=stepX;side=0;}
+    else {sideDistY+=deltaDistY;mapY+=stepY;side=1;}
+    tile=world[player.z][mapY][mapX];
+    if(tile!==EMPTY) hit=1;
+  }
+  const dist=hit?(side===0?(mapX-player.x+(1-stepX)/2)/cos:(mapY-player.y+(1-stepY)/2)/sin):1e6;
+  return {dist,tile,side};
+}
+
+function render(){
+  ctx.fillStyle='#87ceeb'; ctx.fillRect(0,0,canvas.width,canvas.height/2);
+  ctx.fillStyle='#444'; ctx.fillRect(0,canvas.height/2,canvas.width,canvas.height/2);
+  const numRays=canvas.width;
+  const start=player.angle-player.fov/2;
+  for(let x=0;x<numRays;x++){
+    const rayAngle=start+(x/numRays)*player.fov;
+    const {dist,tile,side}=castRay(rayAngle);
+    if(tile!==EMPTY){
+      const corrected=dist*Math.cos(rayAngle-player.angle);
+      const h=Math.min(canvas.height,canvas.height/corrected);
+      const yTop=canvas.height/2-h/2;
+      ctx.fillStyle=tile===GRASS?'#3b3':tile===STONE?'#888':'#0ff';
+      ctx.fillRect(x,yTop,1,h);
     }
+  }
+}
 
-    // Mining
-    canvas.addEventListener('mousedown', e=>{
-      const tx=Math.floor(player.x), ty=Math.floor(player.y);
-      if (world[player.z][ty][tx]!==EMPTY){
-        // add to inventory
-        const t=world[player.z][ty][tx];
-        if (t===GRASS) inventory[0].count++;
-        if (t===STONE) inventory[1].count++;
-        if (t===ORE) inventory[2].count++;
-        world[player.z][ty][tx]=EMPTY;
-      }
-    });
-
-    // Render map view
-    function renderMap(){
-      const scale=Math.min(canvas.width/MAP_W, canvas.height/MAP_H);
-      ctx.fillStyle='#222'; ctx.fillRect(0,0,canvas.width,canvas.height);
-      for (let y=0;y<MAP_H;y++){
-        for (let x=0;x<MAP_W;x++){
-          const t=world[player.z][y][x];
-          ctx.fillStyle = t===EMPTY?'#000':t===GRASS?'#3b3':t===STONE?'#888':'#0ff';
-          ctx.fillRect(x*scale,y*scale,scale,scale);
-        }
-      }
-      ctx.fillStyle='#ffd000';
-      ctx.beginPath();
-      ctx.arc(player.x*scale, player.y*scale, scale*0.3,0,Math.PI*2);
-      ctx.fill();
-      ctx.fillStyle='#fff';
-      ctx.fillText('Depth: '+player.z,10,20);
-    }
-
-    // Render hotbar
-    function renderHotbar(){
-      const barH=64;
-      ctx.fillStyle='rgba(0,0,0,0.5)';
-      ctx.fillRect(0,canvas.height-barH,canvas.width,barH);
-      const slotW=120;
-      ctx.font='16px sans-serif'; ctx.textAlign='left';
-      inventory.forEach((slot,i)=>{
-        const x=i*slotW+8, y=canvas.height-barH+8;
-        ctx.strokeStyle = (i===selectedSlot)?'#ffd000':'#888';
-        ctx.lineWidth=2;
-        ctx.strokeRect(x,y,slotW-16,barH-16);
-        ctx.fillStyle='#fff';
-        ctx.fillText(slot.name+': '+slot.count, x+8, y+28);
-      });
-    }
-
-    // Loop
-    let last=performance.now();
-    function loop(now){
-      const dt=(now-last)/1000; last=now;
-      updatePlayer(dt);
-      renderMap();
-      renderHotbar();
-      requestAnimationFrame(loop);
-    }
-    requestAnimationFrame(loop);
-  })();
-  </script>
+// Loop
+let last=performance.now();
+function loop(now){
+  const dt=(now-last)/1000; last=now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
 </body>
 </html>
-
-
